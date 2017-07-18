@@ -5,7 +5,7 @@ import tensorflow as tf
 
 class Invertor(object):
     """A full waveform invertor for the 1D wave equation."""
-    def __init__(self, init_model, dx, dt, npad=8):
+    def __init__(self, model, dx, dt, npad=8):
         self.nx = len(model)
         self.dx = np.float32(dx)
         self.dt = dt
@@ -17,33 +17,33 @@ class Invertor(object):
         self.current_wavefield = self.wavefield[0]
         self.previous_wavefield = self.wavefield[1]
 
-class VTF(Propagator):
+class TFFWI(Invertor):
     """A TensorFlow implementation."""
-    def __init__(self, model, sources, sources_x, receivers, receivers_x, dx, dt=None, pml_width=6, profile=None):
-        super(VTF, self).__init__(model, dx, dt, npad=pml_width)
+    def __init__(self, model, sources, sources_x, receivers, receivers_x, nsteps, dx, dt=None, pml_width=6, profile=None):
+        super(TFFWI, self).__init__(model, dx, dt, npad=pml_width)
         # Create a TensorFlow Session
         self.sess = tf.Session()
 
         # c(x) is the Variable we are inverting for
-        self.model_padded = tf.Variable(tf.float32, shape=(self.nx_padded))
+        self.model_padded = tf.Variable(self.model_padded)
         model_padded2_dt2 = tf.square(self.model_padded) * dt**2
 
         if profile is None:
-            profile = dx*np.arange(pml_width, dtype=np.float32)
+            profile = 1000/pml_width*np.arange(pml_width, dtype=np.float32)
 
         sigma = np.zeros(self.nx_padded, np.float32)
-        sigma[pml_width-1:-1:-1] = profile
+        sigma[pml_width-1::-1] = profile
         sigma[-pml_width:] = profile
 
         sigma = tf.constant(sigma)
 
         # Create placeholders that will hold:
         #   Two time steps of the wavefield
-        f = tf.zeros(tf.float32, shape=(self.nx_padded))
-        fp = tf.zeros(tf.float32, shape=(self.nx_padded))
+        f = tf.zeros([self.nx_padded])
+        fp = tf.zeros([self.nx_padded])
         #   Two time steps of phi
-        phi = tf.zeros(tf.float32, shape=(self.nx_padded))
-        phip = tf.zeros(tf.float32, shape=(self.nx_padded))
+        phi = tf.zeros([self.nx_padded])
+        phip = tf.zeros([self.nx_padded])
         #   The source amplitude with time, and the source positions
         # tf.sparse_to_dense requires that the indicies of the source positions
         # (sources_x) are in order, so we need to sort them (and thus also the
@@ -57,14 +57,17 @@ class VTF(Propagator):
         sources_v = tf.gather(model_padded2_dt2, sources_x)
 
         rsort = receivers_x.argsort()
+        receivers_sort = receivers[rsort, :]
         receivers_x_sort = receivers_x[rsort]
+
+        receivers = tf.constant(receivers_sort)
         receivers_x = tf.constant(receivers_x_sort + pml_width)
 
         # Create the spatial finite difference kernel that will calculate
         # d/dx, reshape it into the appropriate shape for a 1D
         # convolution, and save it as a constant tensor
-        d1_kernel = np.array([5, -72, 495, -2200, 7425, -23760,
-                              23760, -7435, 2200, -495, 72, -5] / (27720 * self.dx))
+        d1_kernel = np.array([5, -72, 495, -2200, 7425, -23760, 0,
+                              23760, -7425, 2200, -495, 72, -5] / (27720 * self.dx),
                               np.float32)
         d1_kernel = d1_kernel.reshape([-1, 1, 1])
         d1_kernel = tf.constant(d1_kernel)
@@ -85,6 +88,14 @@ class VTF(Propagator):
         d2_kernel = d2_kernel.reshape([-1, 1, 1])
         d2_kernel = tf.constant(d2_kernel)
 
+        # Matrix to set gradient of model in PML regions to first non-PML cell
+        border_mute = np.eye(self.nx_padded, dtype=np.float32)
+        border_mute[:8,:] = 0
+        border_mute[:8,8] = 1
+        border_mute[-7:,:] = 0
+        border_mute[-7:,-8] = 1
+        border_mute = tf.constant(border_mute)
+
         # Calculate d/dx by convolving with the appropriate kernel
         def first_deriv(x):
             return tf.squeeze(tf.nn.conv1d(tf.reshape(x, [1, -1, 1]), d1_kernel, 1, 'SAME'))
@@ -97,12 +108,12 @@ class VTF(Propagator):
 
             # The main evolution equation:
             # f(t+1, x) = c(x)^2 * dt^2 / (1 + dt * sigma(x)/2) * (d^2(f(t, x))/dx^2 + d(phi(t, x)/dx)
-            # + dt * sigma(x) * f(t, x) / (2 + dt * sigma(x))
+            # + dt * sigma(x) * f(t-1, x) / (2 + dt * sigma(x))
             # + 1 / (1 + dt * sigma(x) / 2) * (2 * f(t, x) - f(t-1, x))
-            fp_ = model_padded2_dt2 / (1 + dt * sigma/2)
-                  * (second_deriv(f) + first_deriv(phi))
-                  + dt * sigma * fp / (2 + dt * sigma)
-                  + 1 / (1 + dt * sigma / 2) * (2 * f - fp)
+            fp_ = (model_padded2_dt2 / (1 + dt * sigma/2)
+                   * (second_deriv(f) + first_deriv(phi))
+                   + dt * sigma * fp / (2 + dt * sigma)
+                   + 1 / (1 + dt * sigma / 2) * (2 * f - fp))
 
             # phip(i) =  -sigma(i) * dt * f_x + phi(i) - dt * sigma(i) * phi(i)
             phip_ = -sigma * dt * first_deriv(f) + phi - dt * sigma * phi
@@ -122,25 +133,33 @@ class VTF(Propagator):
             # source amplitudes in the right places.
             fp_ += tf.sparse_to_dense(sources_x, [self.nx_padded], sources_amp)
 
-            receivers_amp = tf.gather(fp_, receivers_x)
+            receivers_amp = tf.reshape(tf.gather(fp_, receivers_x), [-1, 1])
             if step==0:
                 self.y = receivers_amp
             else:
-                self.y = tf.concat([self.y, receivers_amp])
+                self.y = tf.concat([self.y, receivers_amp], axis=1)
 
             fp = f
             f = fp_
             phip = phi
             phi = phip_
             
-        self.init = tf.global_variables_initializer()
         self.loss = tf.losses.mean_squared_error(receivers, self.y)
-        self.optimizer = tf.train.AdamOptimizer().minimize(self.loss)
+        trainer = tf.train.GradientDescentOptimizer(10000)
+        #trainer = tf.train.AdamOptimizer(learning_rate=1)
+        [(self.y_grad, self.y_val)]  = trainer.compute_gradients(self.loss)
+        self.y_grad = tf.squeeze(tf.matmul(border_mute, tf.expand_dims(self.y_grad, 1)))
+        self.optimizer = trainer.apply_gradients([(self.y_grad, self.y_val)])
+        #self.optimizer = tf.train.AdamOptimizer().minimize(self.loss)
+        self.init = tf.global_variables_initializer()
 
-        def invert(nsteps=100):
-            self.sess.run(self.init)
-            for step in range(nsteps):
-                _, l, prediction = self.sess.run([self.optimizer, self.loss, self.y])
-                print(step, l)
+    def invert(self, nsteps=100, print_freq=100):
+        self.sess.run(self.init)
+        for step in range(nsteps):
+            _, l, pred_y, pred_model = self.sess.run([self.optimizer, self.loss, self.y, self.model_padded])
+            if step % np.maximum(int(np.round(nsteps/print_freq)),1) == 0:
+              print(step, l)
+
+        return pred_y, pred_model
             
 
