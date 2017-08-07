@@ -4,7 +4,7 @@ import numpy as np
 import tensorflow as tf
 
 class Propagator(object):
-    """An 8th order finite difference propagator for the 1D wave equation."""
+    """A 16th order finite difference propagator for the 1D wave equation."""
     def __init__(self, model, dx, dt=None, npad=8):
         self.nx = len(model)
         self.dx = np.float32(dx)
